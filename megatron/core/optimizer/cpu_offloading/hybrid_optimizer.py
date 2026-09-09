@@ -319,6 +319,31 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 if self.param_update_in_fp32:
                     new_state[orig_param]["master_param"] = param
         self.state = new_state
+        self._sync_sub_optimizer_group_steps_to_hdo()
+
+    def _sync_sub_optimizer_group_steps_to_hdo(self):
+        """
+        Carry a sub-optimizer's per-group step counter into the HDO's param groups.
+
+        Some optimizers (TransformerEngine's FusedAdam) keep the Adam step in
+        `param_group["step"]` rather than in per-parameter state, so it is part of
+        neither `state_dict()["state"]` nor the HDO's own groups. Mirroring it here
+        puts it in the checkpoint, and `_sync_hdo_param_groups_to_sub_optimizers`
+        hands it back to the sub-optimizer after a load, so the bias correction
+        continues instead of restarting from step 1.
+        """
+        orig_param_to_group_index = {}
+        for i, group in enumerate(self.param_groups):
+            for param in group["params"]:
+                orig_param_to_group_index[param] = i
+        for optimizer in self.sub_optimizers:
+            for group in optimizer.param_groups:
+                if "step" not in group or len(group["params"]) == 0:
+                    continue
+                orig_param = self.inner_param_to_orig_param.get(group["params"][0])
+                group_index = orig_param_to_group_index.get(orig_param)
+                if group_index is not None:
+                    self.param_groups[group_index]["step"] = group["step"]
 
     def _sync_hdo_state_to_sub_optimizers(self):
         for optimizer in self.sub_optimizers:
