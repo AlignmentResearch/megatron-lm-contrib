@@ -695,6 +695,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             )
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = packed_seq_params.seq_idx
+            assert seq_idx is not None, (
+                "Packed sequences reached the Mamba mixer without seq_idx. "
+                "PackedSeqParams derives seq_idx only when total_tokens is set. "
+                "Running the SSM kernel without seq_idx silently carries SSM and "
+                "convolution state across the samples of a pack."
+            )
 
         state_dtype_kwarg = (
             {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
