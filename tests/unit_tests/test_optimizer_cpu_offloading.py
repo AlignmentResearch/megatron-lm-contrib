@@ -332,3 +332,71 @@ def test_load_state_dict_reuses_the_cpu_copies_and_resumes_exactly(dtype, offloa
     _train_steps(net2, hdo2, x, 2)
     for (name, p1), p2 in zip(net1.named_parameters(), net2.parameters()):
         torch.testing.assert_close(p1, p2, rtol=0, atol=0, msg=lambda m: f"{name}: {m}")
+
+
+@pytest.mark.skipif(
+    torch.__version__ < '2.3.0',
+    reason=(
+        "Requires PyTorch 2.3.0 or higher, lower versions of pytorch have "
+        "misaligned optimizer accuracy for CPU and GPU."
+    ),
+)
+@pytest.mark.parametrize('param_update_in_fp32', [False, True])
+def test_a_load_that_carries_no_master_weights_does_not_clobber_the_model(param_update_in_fp32):
+    """The resume order is: build the optimizer, load the weights, load the optimizer state.
+
+    An inner parameter (here the pinned CPU copy of an offloaded parameter) is cloned when the
+    optimizer is built, so at that point it holds the PRE-load weights. The optimizer state
+    carries parameter values only as `master_param`, and only when `param_update_in_fp32` is on;
+    with it off there are none to carry, so nothing in the load refreshes the copy. The next step
+    then updates the stale copy and the copy-back hook writes it over the weights the checkpoint
+    restored -- silently, since the loss keeps falling from the wrong parameters.
+
+    Rebuilding the sub-optimizers used to hide this by re-cloning every copy from the model; the
+    post-load refresh is what replaces that. `param_update_in_fp32=True` is parametrized alongside
+    to pin that the refresh does not disturb the path that does carry masters.
+    """
+    setup_seed(42)
+
+    def hdo_for(params):
+        return HybridDeviceOptimizer(
+            params,
+            offload_fraction=1.0,  # every parameter gets a pinned CPU copy
+            lr=1e-3,
+            overlap_cpu_optimizer_d2h_h2d=True,
+            param_update_in_fp32=param_update_in_fp32,
+            cpu_optimizer_cls=Adam,
+            gpu_optimizer_cls=GPUAdam,
+        )
+
+    # The run that gets checkpointed: three steps, then its weights and optimizer state are saved.
+    trained = Net().cuda()
+    hdo = hdo_for(list(trained.parameters()))
+    x = torch.randn(4, 3, 32, 32, device='cuda')
+    _train_steps(trained, hdo, x, 3)
+    saved_weights = copy.deepcopy(trained.state_dict())
+    saved_optimizer = copy.deepcopy(hdo.state_dict())
+
+    # The resume: a fresh model whose weights differ from the checkpoint's, an optimizer built
+    # over it (so its CPU copies hold THOSE weights), then the checkpoint's weights, then its
+    # optimizer state.
+    setup_seed(7)
+    resumed = Net().cuda()
+    assert not torch.equal(
+        next(resumed.parameters()), saved_weights[next(iter(saved_weights))]
+    ), "the fresh model must differ from the checkpoint, or there is nothing to clobber"
+    resumed_hdo = hdo_for(list(resumed.parameters()))
+    resumed.load_state_dict(saved_weights)
+    resumed_hdo.load_state_dict(saved_optimizer)
+
+    # Every inner parameter now agrees with the restored weights, whether the load supplied a
+    # master weight or not.
+    for param, inner in resumed_hdo.param_to_inner_param.items():
+        torch.testing.assert_close(inner.to(param.device, param.dtype), param, rtol=0, atol=0)
+
+    # And one step continues from the restored weights instead of jumping back to the fresh ones:
+    # against the same step taken by the run that was checkpointed.
+    _train_steps(trained, hdo, x, 1)
+    _train_steps(resumed, resumed_hdo, x, 1)
+    for (name, p1), p2 in zip(trained.named_parameters(), resumed.parameters()):
+        torch.testing.assert_close(p1, p2, rtol=0, atol=0, msg=lambda m: f"{name}: {m}")

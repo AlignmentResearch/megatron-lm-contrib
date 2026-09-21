@@ -391,6 +391,34 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     else:
                         self.state[orig_param][k] = state[k] = v.to("cuda")
 
+    def _refresh_inner_params_without_loaded_values(self):
+        """Bring every inner parameter the load supplied no value for back in line with its
+        parameter.
+
+        An inner parameter -- the fp32 clone of a bf16 parameter, or the pinned CPU copy of an
+        offloaded one -- holds the values it was cloned from when the optimizer was built. A
+        checkpoint carries those values only as the state's `master_param`, and only when
+        `param_update_in_fp32` is on: with it off the optimizer state has no parameter values at
+        all, and even with it on a parameter whose state was never written (never stepped, or an
+        older checkpoint) has none.
+
+        The usual resume order is: build the optimizer, load the model weights, load the optimizer
+        state. So an inner parameter nothing refreshed still holds the PRE-load values, and the
+        next step would update those and copy them back over the weights the checkpoint restored
+        (`_register_param_copy_back_gpu_hook`). Rebuilding the sub-optimizers hid this by
+        re-cloning every copy from the model; keeping them (which is the point of this path) means
+        doing the copy here instead -- one copy per parameter, no allocation.
+
+        `_update_fp32_params_by_new_state` runs first and re-points a loaded `master_param` at the
+        inner parameter, so an entry that points at it is exactly one the load did supply.
+        """
+        for param, inner_param in self.param_to_inner_param.items():
+            if inner_param is param:
+                continue
+            if self.state.get(param, {}).get("master_param") is inner_param:
+                continue
+            inner_param.data.copy_(param.data)
+
     def _update_fp32_params_by_new_state(self):
         """
         Bring every inner parameter in line with the `master_param` of its state
@@ -482,6 +510,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             # optimizer on the host that was ~500 GB per node that never came back.
             self._sync_hdo_param_groups_to_sub_optimizers()
             self._sync_hdo_state_to_sub_optimizers()
+
+            # 3. An inner parameter the load supplied no value for is refreshed from its
+            # parameter, which rebuilding the sub-optimizers used to do by re-cloning.
+            self._refresh_inner_params_without_loaded_values()
 
         self.register_load_state_dict_post_hook(post_load_state_dict_hook)
 
