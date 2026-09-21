@@ -193,6 +193,67 @@ class TestForkBaseIdentity(unittest.TestCase):
             ],
         )
 
+    def test_a_rename_of_this_repository_is_allowed(self) -> None:
+        """The manifest may follow the repository's own rename, and only that.
+
+        `fork_repo` has to equal `origin` (test_root_fork_must_match_origin), so the old name
+        fails root identity and the new one would fail the identity-stability rule: without this
+        carve-out a rename cannot be recorded through a pull request at all.
+        """
+        previous = {
+            "fork_repo": "https://github.com/AlignmentResearch/Megatron-LM",
+            "upstream_repo": "https://github.com/NVIDIA/Megatron-LM",
+            "upstream_branch": "main",
+            "upstream_base": "a" * 40,
+        }
+        renamed = {
+            **previous,
+            "fork_repo": "https://github.com/AlignmentResearch/megatron-lm-contrib",
+        }
+
+        def git(*args: str, **kwargs: object) -> str:
+            if args[:2] == ("remote", "get-url"):
+                return "https://github.com/AlignmentResearch/megatron-lm-contrib.git"
+            return json.dumps(previous)
+
+        with patch.object(fork_base, "_git", side_effect=git):
+            problems, notes = fork_base.check_forward(
+                Path("/repo"), renamed, previous["upstream_base"], "origin/farai/main"
+            )
+
+        self.assertEqual((problems, notes), ([], []))
+
+    def test_a_fork_repo_that_is_not_this_repository_is_still_refused(self) -> None:
+        """The carve-out is a rename, not a free hand: a new name that origin does not answer to
+        is still a different fork, and two forks sharing an upstream base carry different patches.
+        """
+        previous = {
+            "fork_repo": "https://github.com/AlignmentResearch/Megatron-LM",
+            "upstream_repo": "https://github.com/NVIDIA/Megatron-LM",
+            "upstream_branch": "main",
+            "upstream_base": "a" * 40,
+        }
+        elsewhere = {**previous, "fork_repo": "https://github.com/example/other-fork"}
+
+        def git(*args: str, **kwargs: object) -> str:
+            if args[:2] == ("remote", "get-url"):
+                return "https://github.com/AlignmentResearch/megatron-lm-contrib.git"
+            return json.dumps(previous)
+
+        with patch.object(fork_base, "_git", side_effect=git):
+            problems, _ = fork_base.check_forward(
+                Path("/repo"), elsewhere, previous["upstream_base"], "origin/farai/main"
+            )
+
+        self.assertEqual(
+            problems,
+            [
+                "manifest identity changed for fork_repo: origin/farai/main "
+                "records https://github.com/AlignmentResearch/Megatron-LM, current records "
+                "https://github.com/example/other-fork"
+            ],
+        )
+
     def test_missing_target_manifest_is_a_bootstrap_note(self) -> None:
         missing = subprocess.CalledProcessError(128, ["git", "show"])
         with patch.object(fork_base, "_git", side_effect=missing):

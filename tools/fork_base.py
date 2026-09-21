@@ -404,6 +404,10 @@ def check_forward(
         return [f"{MANIFEST} on {against} must contain a JSON object"], []
 
     problems = []
+    try:
+        origin = _git("remote", "get-url", "origin", cwd=root)
+    except subprocess.CalledProcessError:
+        origin = ""
     for field in ("fork_repo", "upstream_repo", "upstream_branch"):
         old_value = previous.get(field, "")
         current_value = current.get(field, "")
@@ -416,6 +420,19 @@ def check_forward(
             else old_value == current_value
         )
         if not values_match:
+            # A rename of THIS repository is the one identity change a pull request can
+            # legitimately carry. `fork_repo` must equal `origin` -- `check_root_identity`
+            # enforces that independently and on every run -- so a new value that agrees with
+            # origin re-points the manifest at this repository under its new name, never at a
+            # different fork. Without this the rename is unrepresentable: the old name fails root
+            # identity, the new name fails this rule, and every pull request in the repository
+            # stays red until someone pushes past the check.
+            if (
+                field == "fork_repo"
+                and origin
+                and normalize(current_value) == normalize(origin)
+            ):
+                continue
             problems.append(
                 f"manifest identity changed for {field}: {against} records "
                 f"{old_value or '<missing>'}, current records {current_value or '<missing>'}"
