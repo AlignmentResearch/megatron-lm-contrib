@@ -319,6 +319,31 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 if self.param_update_in_fp32:
                     new_state[orig_param]["master_param"] = param
         self.state = new_state
+        self._sync_sub_optimizer_group_steps_to_hdo()
+
+    def _sync_sub_optimizer_group_steps_to_hdo(self):
+        """
+        Carry a sub-optimizer's per-group step counter into the HDO's param groups.
+
+        Some optimizers (TransformerEngine's FusedAdam) keep the Adam step in
+        `param_group["step"]` rather than in per-parameter state, so it is part of
+        neither `state_dict()["state"]` nor the HDO's own groups. Mirroring it here
+        puts it in the checkpoint, and `_sync_hdo_param_groups_to_sub_optimizers`
+        hands it back to the sub-optimizer after a load, so the bias correction
+        continues instead of restarting from step 1.
+        """
+        orig_param_to_group_index = {}
+        for i, group in enumerate(self.param_groups):
+            for param in group["params"]:
+                orig_param_to_group_index[param] = i
+        for optimizer in self.sub_optimizers:
+            for group in optimizer.param_groups:
+                if "step" not in group or len(group["params"]) == 0:
+                    continue
+                orig_param = self.inner_param_to_orig_param.get(group["params"][0])
+                group_index = orig_param_to_group_index.get(orig_param)
+                if group_index is not None:
+                    self.param_groups[group_index]["step"] = group["step"]
 
     def _sync_hdo_state_to_sub_optimizers(self):
         for optimizer in self.sub_optimizers:
@@ -366,12 +391,60 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     else:
                         self.state[orig_param][k] = state[k] = v.to("cuda")
 
+    def _refresh_inner_params_without_loaded_values(self):
+        """Bring every inner parameter the load supplied no value for back in line with its
+        parameter.
+
+        An inner parameter -- the fp32 clone of a bf16 parameter, or the pinned CPU copy of an
+        offloaded one -- holds the values it was cloned from when the optimizer was built. A
+        checkpoint carries those values only as the state's `master_param`, and only when
+        `param_update_in_fp32` is on: with it off the optimizer state has no parameter values at
+        all, and even with it on a parameter whose state was never written (never stepped, or an
+        older checkpoint) has none.
+
+        The usual resume order is: build the optimizer, load the model weights, load the optimizer
+        state. So an inner parameter nothing refreshed still holds the PRE-load values, and the
+        next step would update those and copy them back over the weights the checkpoint restored
+        (`_register_param_copy_back_gpu_hook`). Rebuilding the sub-optimizers hid this by
+        re-cloning every copy from the model; keeping them (which is the point of this path) means
+        doing the copy here instead -- one copy per parameter, no allocation.
+
+        `_update_fp32_params_by_new_state` runs first and re-points a loaded `master_param` at the
+        inner parameter, so an entry that points at it is exactly one the load did supply.
+        """
+        for param, inner_param in self.param_to_inner_param.items():
+            if inner_param is param:
+                continue
+            if self.state.get(param, {}).get("master_param") is inner_param:
+                continue
+            inner_param.data.copy_(param.data)
+
     def _update_fp32_params_by_new_state(self):
+        """
+        Bring every inner parameter in line with the `master_param` of its state
+        after the state changed under us (a `load_state_dict`).
+
+        The inner parameter is the fp32 clone of a bf16 parameter or the pinned
+        CPU copy of an offloaded one. When the entry already points at the inner
+        parameter (an in-place load) there is nothing to do; otherwise the loaded
+        values are copied in and the entry is re-pointed, so the loaded tensor is
+        not kept alive next to the copy. A parameter without an inner copy (GPU
+        resident, natively fp32) is its own inner parameter and no longer raises
+        a KeyError.
+        """
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            fp32_param = self.param_to_fp32_param[param]
-            fp32_param.data.copy_(v["master_param"])
+            master_param = v.get("master_param")
+            inner_param = self.param_to_inner_param.get(param)
+            if master_param is None or inner_param is None or master_param is inner_param:
+                continue
+            # A GPU-resident parameter without a copy is its own inner parameter: the
+            # values are copied in and the entry re-pointed all the same, since a
+            # sub-optimizer that reads `master_param` (FusedAdam) must find the
+            # tensor it updates, not a loaded duplicate of it.
+            inner_param.data.copy_(master_param)
+            v["master_param"] = inner_param
 
     def update_fp32_param_by_new_param(self):
         """
@@ -397,43 +470,50 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             Returns:
                 dict: The modified state dictionary with `float32` parameters.
             """
-            if not self.param_update_in_fp32:
-                return state_dict
-
+            # Every parameter is swapped for its inner parameter (the fp32 clone of a
+            # bf16 parameter, or the pinned CPU copy of an offloaded one) so that
+            # torch casts the loaded state to the inner parameter's dtype and device:
+            # fp32, and the CPU for offloaded parameters. Without the swap the whole
+            # offloaded state would be staged through the GPU first.
             new_state = {}
             for param, v in self.state.items():
-                param = self.param_to_fp32_param.get(param, param)
+                param = self.param_to_inner_param.get(param, param)
                 new_state[param] = v
             self.state = new_state
 
             for group in self.param_groups:
                 for i, param in enumerate(group["params"]):
-                    group["params"][i] = self.param_to_fp32_param.get(param, param)
+                    group["params"][i] = self.param_to_inner_param.get(param, param)
 
             return state_dict
 
         self.register_load_state_dict_pre_hook(pre_load_state_dict_hook)
 
         def post_load_state_dict_hook(self):
-            # 1. Replace the temporarily replaced fp32 parameters back. Please
+            # 1. Replace the temporarily swapped inner parameters back. Please
             # refer to the documentation in `pre_load_state_dict_hook`.
-            if self.param_update_in_fp32:
-                new_state = {}
-                for param, v in self.state.items():
-                    orig_param = self.fp32_param_to_orig_param.get(param, param)
-                    new_state[orig_param] = v
-                self.state = new_state
+            new_state = {}
+            for param, v in self.state.items():
+                orig_param = self.inner_param_to_orig_param.get(param, param)
+                new_state[orig_param] = v
+            self.state = new_state
 
-                for group in self.param_groups:
-                    for i, param in enumerate(group["params"]):
-                        group["params"][i] = self.fp32_param_to_orig_param.get(param, param)
+            for group in self.param_groups:
+                for i, param in enumerate(group["params"]):
+                    group["params"][i] = self.inner_param_to_orig_param.get(param, param)
 
-            # 2. After loading state_dict, the parameters may change, and we need to
-            # reinitialize the sub-optimizers to regenerate the new parameters and
-            # cpu copy pairs.
-            self._init_sub_optimizers()
+            # 2. The sub-optimizers, their pinned CPU copies and gradient buffers are
+            # kept: the parameters themselves do not change on a load, only their
+            # values and the optimizer state. Rebuilding them (as before) allocated a
+            # second full set of pinned copies while the state kept the first one
+            # alive through `master_param`; on a 120B model resumed with the
+            # optimizer on the host that was ~500 GB per node that never came back.
             self._sync_hdo_param_groups_to_sub_optimizers()
             self._sync_hdo_state_to_sub_optimizers()
+
+            # 3. An inner parameter the load supplied no value for is refreshed from its
+            # parameter, which rebuilding the sub-optimizers used to do by re-cloning.
+            self._refresh_inner_params_without_loaded_values()
 
         self.register_load_state_dict_post_hook(post_load_state_dict_hook)
 

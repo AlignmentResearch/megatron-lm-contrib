@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "fork_repo": "https://github.com/AlignmentResearch/Megatron-LM",
+  "fork_repo": "https://github.com/AlignmentResearch/megatron-lm-contrib",
   "upstream_repo": "https://github.com/NVIDIA/Megatron-LM",
   "upstream_branch": "main",
   "upstream_base": "d12f6c8c9aff51e166d872fd70151687a8e3f375"
