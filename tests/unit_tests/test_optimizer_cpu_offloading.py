@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import copy
 import random
 
 import numpy as np
@@ -253,3 +254,149 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         assert torch.allclose(
             v, ref_params[k], atol=1e-03
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+
+
+def _hybrid_adam(params, offload_fraction):
+    return HybridDeviceOptimizer(
+        params,
+        offload_fraction=offload_fraction,
+        lr=1e-3,
+        overlap_cpu_optimizer_d2h_h2d=True,
+        param_update_in_fp32=True,
+        cpu_optimizer_cls=Adam,
+        gpu_optimizer_cls=GPUAdam,
+    )
+
+
+def _train_steps(net, hdo, x, n_steps):
+    for _ in range(n_steps):
+        hdo.zero_grad()
+        net(x).float().sum().backward()
+        hdo.step()
+
+
+@pytest.mark.skipif(
+    torch.__version__ < '2.3.0',
+    reason=(
+        "Requires PyTorch 2.3.0 or higher, lower versions of pytorch have "
+        "misaligned optimizer accuracy for CPU and GPU."
+    ),
+)
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize('offload_fraction', [0.5, 1.0])
+def test_load_state_dict_reuses_the_cpu_copies_and_resumes_exactly(dtype, offload_fraction):
+    """A loaded optimizer keeps its sub-optimizers, pinned CPU copies and gradient
+    buffers (no second set is allocated), points every `master_param` at the live
+    inner parameter, and then steps exactly like the optimizer it was saved from.
+
+    Natively fp32 parameters used to raise a KeyError in the post-load hook (no fp32
+    clone), and a bf16 parameter's fp32 master carries precision the bf16 weight lost,
+    so an exact continuation needs the loaded master copied into the live clone.
+    """
+    setup_seed(42)
+    net1 = Net().cuda().to(dtype)
+    hdo1 = _hybrid_adam(list(net1.parameters()), offload_fraction)
+    x = torch.randn(4, 3, 32, 32, device='cuda', dtype=dtype)
+    _train_steps(net1, hdo1, x, 3)
+    # state_dict() hands out the live tensors; a checkpoint round trip yields fresh ones
+    saved = copy.deepcopy(hdo1.state_dict())
+
+    # a fresh optimizer over the same (bf16-rounded) weights, as a resume builds one
+    net2 = Net().cuda().to(dtype)
+    net2.load_state_dict(net1.state_dict())
+    hdo2 = _hybrid_adam(list(net2.parameters()), offload_fraction)
+    inner_before = dict(hdo2.param_to_inner_param)
+    cpu_optimizers_before = list(hdo2.cpu_optimizers)
+    grad_buffers_before = hdo2.cpu_copy_map_grad
+
+    hdo2.load_state_dict(saved)
+
+    # 1. nothing was rebuilt: the same inner parameters, sub-optimizers and gradient buffer map
+    assert hdo2.param_to_inner_param.keys() == inner_before.keys()
+    for param, inner in inner_before.items():
+        assert hdo2.param_to_inner_param[param] is inner
+    assert len(hdo2.cpu_optimizers) == len(cpu_optimizers_before)
+    for a, b in zip(hdo2.cpu_optimizers, cpu_optimizers_before):
+        assert a is b
+    assert hdo2.cpu_copy_map_grad is grad_buffers_before
+
+    # 2. the state refers to the live inner parameters and lives where they live
+    for param, state in hdo2.state.items():
+        assert state["master_param"] is hdo2.param_to_inner_param[param]
+        expect_cpu = param in hdo2.gpu_params_map_cpu_copy
+        assert state["exp_avg"].is_cuda != expect_cpu
+        assert state["exp_avg_sq"].is_cuda != expect_cpu
+
+    # 3. the continuation is exact: same masters, same moments, same steps
+    _train_steps(net1, hdo1, x, 2)
+    _train_steps(net2, hdo2, x, 2)
+    for (name, p1), p2 in zip(net1.named_parameters(), net2.parameters()):
+        torch.testing.assert_close(p1, p2, rtol=0, atol=0, msg=lambda m: f"{name}: {m}")
+
+
+@pytest.mark.skipif(
+    torch.__version__ < '2.3.0',
+    reason=(
+        "Requires PyTorch 2.3.0 or higher, lower versions of pytorch have "
+        "misaligned optimizer accuracy for CPU and GPU."
+    ),
+)
+@pytest.mark.parametrize('param_update_in_fp32', [False, True])
+def test_a_load_that_carries_no_master_weights_does_not_clobber_the_model(param_update_in_fp32):
+    """The resume order is: build the optimizer, load the weights, load the optimizer state.
+
+    An inner parameter (here the pinned CPU copy of an offloaded parameter) is cloned when the
+    optimizer is built, so at that point it holds the PRE-load weights. The optimizer state
+    carries parameter values only as `master_param`, and only when `param_update_in_fp32` is on;
+    with it off there are none to carry, so nothing in the load refreshes the copy. The next step
+    then updates the stale copy and the copy-back hook writes it over the weights the checkpoint
+    restored -- silently, since the loss keeps falling from the wrong parameters.
+
+    Rebuilding the sub-optimizers used to hide this by re-cloning every copy from the model; the
+    post-load refresh is what replaces that. `param_update_in_fp32=True` is parametrized alongside
+    to pin that the refresh does not disturb the path that does carry masters.
+    """
+    setup_seed(42)
+
+    def hdo_for(params):
+        return HybridDeviceOptimizer(
+            params,
+            offload_fraction=1.0,  # every parameter gets a pinned CPU copy
+            lr=1e-3,
+            overlap_cpu_optimizer_d2h_h2d=True,
+            param_update_in_fp32=param_update_in_fp32,
+            cpu_optimizer_cls=Adam,
+            gpu_optimizer_cls=GPUAdam,
+        )
+
+    # The run that gets checkpointed: three steps, then its weights and optimizer state are saved.
+    trained = Net().cuda()
+    hdo = hdo_for(list(trained.parameters()))
+    x = torch.randn(4, 3, 32, 32, device='cuda')
+    _train_steps(trained, hdo, x, 3)
+    saved_weights = copy.deepcopy(trained.state_dict())
+    saved_optimizer = copy.deepcopy(hdo.state_dict())
+
+    # The resume: a fresh model whose weights differ from the checkpoint's, an optimizer built
+    # over it (so its CPU copies hold THOSE weights), then the checkpoint's weights, then its
+    # optimizer state.
+    setup_seed(7)
+    resumed = Net().cuda()
+    assert not torch.equal(
+        next(resumed.parameters()), saved_weights[next(iter(saved_weights))]
+    ), "the fresh model must differ from the checkpoint, or there is nothing to clobber"
+    resumed_hdo = hdo_for(list(resumed.parameters()))
+    resumed.load_state_dict(saved_weights)
+    resumed_hdo.load_state_dict(saved_optimizer)
+
+    # Every inner parameter now agrees with the restored weights, whether the load supplied a
+    # master weight or not.
+    for param, inner in resumed_hdo.param_to_inner_param.items():
+        torch.testing.assert_close(inner.to(param.device, param.dtype), param, rtol=0, atol=0)
+
+    # And one step continues from the restored weights instead of jumping back to the fresh ones:
+    # against the same step taken by the run that was checkpointed.
+    _train_steps(trained, hdo, x, 1)
+    _train_steps(resumed, resumed_hdo, x, 1)
+    for (name, p1), p2 in zip(trained.named_parameters(), resumed.parameters()):
+        torch.testing.assert_close(p1, p2, rtol=0, atol=0, msg=lambda m: f"{name}: {m}")
